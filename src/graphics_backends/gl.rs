@@ -1,7 +1,7 @@
 use super::GraphicsBackend;
 use derive_more::Deref;
 #[cfg(target_family = "unix")]
-use glutin_egl_sys::egl::Egl;
+use glutin_egl_sys::egl::{self, Egl};
 use glutin_glx_sys::{
     glx::{self, Glx},
     Success,
@@ -35,9 +35,22 @@ static LOAD_GL: Once = Once::new();
 
 impl GlData {
     pub(crate) fn new() -> Self {
-        Glx::new()
+        let session_info = Glx::new()
             .or_else(Egl::new)
-            .expect("failed to initialize GlData")
+            .expect("failed to initialize GlData");
+
+        let mut fbos = [0; 2];
+        unsafe {
+            gl::GenFramebuffers(fbos.len() as i32, fbos.as_mut_ptr());
+        }
+
+        GlData {
+            session_data: Arc::new(SessionCreateInfo(session_info)),
+            images: Default::default(),
+            format: 0,
+            read_fbo: fbos[0],
+            draw_fbo: fbos[1],
+        }
     }
 }
 
@@ -46,7 +59,8 @@ trait GraphicsExt {
     type Context: Sized;
     unsafe fn current_display(&self) -> Option<Self::Display>;
     unsafe fn current_context(&self) -> Option<Self::Context>;
-    fn new() -> Option<GlData>;
+    #[allow(clippy::new_ret_no_self)]
+    fn new() -> Option<xr::opengl::SessionCreateInfo>;
 }
 
 #[inline]
@@ -72,12 +86,17 @@ impl GraphicsExt for Egl {
     }
 
     #[cfg(target_family = "unix")]
-    fn new() -> Option<GlData> {
+    fn new() -> Option<xr::opengl::SessionCreateInfo> {
+        use std::mem::transmute;
+        let gpa = NonNull::new(EGL.get(c"eglGetProcAddress").cast_mut())
+            .map(|p| unsafe {
+                transmute::<*mut c_void, unsafe extern "system" fn(*const c_char) -> Option<unsafe extern "system" fn()>>(p.as_ptr())
+            })?;
         let egl = Egl::load_with(|func| {
             let func = unsafe { CString::from_vec_unchecked(func.as_bytes().to_vec()) };
-            EGL.get(&func)
+            unsafe { transmute::<_, *const c_void>(gpa(func.as_bytes().as_ptr().cast())) }
         });
-        let (_display, _context) = unsafe { (egl.current_display()?, egl.current_context()?) };
+        let (display, context) = unsafe { (egl.current_display()?, egl.current_context()?) };
         LOAD_GL.call_once(|| {
             gl::load_with(|f| {
                 let f = unsafe { CString::from_vec_unchecked(f.as_bytes().to_vec()) };
@@ -85,7 +104,36 @@ impl GraphicsExt for Egl {
             });
             unsafe { init_debug(); }
         });
-        todo!();
+        let config = unsafe {
+            let mut config_id = MaybeUninit::uninit();
+            if egl.QueryContext(
+                display.as_ptr(),
+                context.as_ptr(),
+                egl::CONFIG_ID as _,
+                config_id.as_mut_ptr(),
+            ) != egl::TRUE {
+                return None;
+            }
+            let attribs: [egl::EGLint; 3] = [egl::CONFIG_ID as _, config_id.assume_init(), egl::NONE as _];
+            let mut configs = [std::ptr::null(); 1];
+            let mut config_count = 0;
+            if egl.ChooseConfig(
+                display.as_ptr(),
+                attribs.as_ptr(),
+                configs.as_mut_ptr(),
+                configs.len() as _,
+                &mut config_count as *mut _,
+            ) != egl::TRUE {
+                return None;
+            }
+            configs[0].cast_mut()
+        };
+        xr::opengl::SessionCreateInfo::Egl {
+            get_proc_address: Some(gpa),
+            display: display.as_ptr(),
+            context: context.as_ptr(),
+            config,
+        }.into()
     }
 
     #[cfg(not(target_family = "unix"))]
@@ -106,7 +154,7 @@ impl GraphicsExt for Glx {
         NonNull::new(self.GetCurrentContext().cast_mut())
     }
 
-    fn new() -> Option<GlData> {
+    fn new() -> Option<xr::opengl::SessionCreateInfo> {
         let glx = Glx::load_with(|func| {
             let func = unsafe { CString::from_vec_unchecked(func.as_bytes().to_vec()) };
             GLX.get(&func)
@@ -145,7 +193,7 @@ impl GraphicsExt for Glx {
 
         // Grab the session info on creation - this makes us resilient against session restarts,
         // which could result in us trying to grab the context from a different thread
-        let session_info = unsafe {
+        Some(unsafe {
             let glx_drawable = glx.GetCurrentDrawable();
 
             let attrs = [glx::FBCONFIG_ID, config_id as _, glx::NONE];
@@ -177,20 +225,7 @@ impl GraphicsExt for Glx {
                 glx_drawable,
                 glx_context: glx_context.cast_mut(),
             }
-        };
-
-        let mut fbos = [0; 2];
-        unsafe {
-            gl::GenFramebuffers(fbos.len() as i32, fbos.as_mut_ptr());
-        }
-
-        GlData {
-            session_data: Arc::new(SessionCreateInfo(session_info)),
-            images: Default::default(),
-            format: 0,
-            read_fbo: fbos[0],
-            draw_fbo: fbos[1],
-        }.into()
+        })
     }
 }
 

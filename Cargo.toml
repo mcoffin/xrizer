@@ -16,7 +16,7 @@ members = ["openvr", "shaders", "xbuild"]
 
 [workspace.dependencies]
 ash = "0.38.0"
-openxr = { path = "./openxrs/openxr", features = ["static"] }
+openxr = { path = "./openxrs/openxr", features = ["static", "mndx_egl_enable"] }
 openxr-sys = { path = "./openxrs/sys" }
 slotmap = "1.0.7"
 glam = "0.29.0"
