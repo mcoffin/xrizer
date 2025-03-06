@@ -1,0 +1,3 @@
+[submodule "openxrs"]
+	path = openxrs
+	url = https://github.com/ralith/openxrs.git

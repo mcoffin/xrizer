@@ -1,5 +1,7 @@
 use super::GraphicsBackend;
 use derive_more::Deref;
+#[cfg(target_family = "unix")]
+use glutin_egl_sys::egl::Egl;
 use glutin_glx_sys::{
     glx::{self, Glx},
     Success,
@@ -8,10 +10,11 @@ use libc::{dlerror, dlopen, dlsym};
 use log::warn;
 use openvr as vr;
 use openxr as xr;
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::{ffi::{c_char, c_void, CStr, CString}, mem::MaybeUninit, ptr::NonNull};
 use std::sync::{Arc, LazyLock, Once};
 
 static GLX: LazyLock<Library> = LazyLock::new(|| Library::new(c"libGLX.so.0"));
+static EGL: LazyLock<Library> = LazyLock::new(|| Library::new(c"libEGL.so.1"));
 
 pub struct GlData {
     session_data: Arc<SessionCreateInfo>,
@@ -28,50 +31,122 @@ struct SessionCreateInfo(xr::opengl::SessionCreateInfo);
 unsafe impl Send for SessionCreateInfo {}
 unsafe impl Sync for SessionCreateInfo {}
 
+static LOAD_GL: Once = Once::new();
+
 impl GlData {
     pub(crate) fn new() -> Self {
+        Glx::new()
+            .or_else(Egl::new)
+            .expect("failed to initialize GlData")
+    }
+}
+
+trait GraphicsExt {
+    type Display: Sized;
+    type Context: Sized;
+    unsafe fn current_display(&self) -> Option<Self::Display>;
+    unsafe fn current_context(&self) -> Option<Self::Context>;
+    fn new() -> Option<GlData>;
+}
+
+#[inline]
+unsafe fn init_debug() {
+    if log::log_enabled!(log::Level::Debug) {
+        gl::DebugMessageCallback(Some(debug_message), std::ptr::null());
+        gl::Enable(gl::DEBUG_OUTPUT);
+    }
+}
+
+impl GraphicsExt for Egl {
+    type Display = NonNull<c_void>;
+    type Context = NonNull<c_void>;
+
+    #[inline]
+    unsafe fn current_display(&self) -> Option<Self::Display> {
+        NonNull::new(self.GetCurrentDisplay().cast_mut())
+    }
+
+    #[inline]
+    unsafe fn current_context(&self) -> Option<Self::Context> {
+        NonNull::new(self.GetCurrentContext().cast_mut())
+    }
+
+    #[cfg(target_family = "unix")]
+    fn new() -> Option<GlData> {
+        let egl = Egl::load_with(|func| {
+            let func = unsafe { CString::from_vec_unchecked(func.as_bytes().to_vec()) };
+            EGL.get(&func)
+        });
+        let (_display, _context) = unsafe { (egl.current_display()?, egl.current_context()?) };
+        LOAD_GL.call_once(|| {
+            gl::load_with(|f| {
+                let f = unsafe { CString::from_vec_unchecked(f.as_bytes().to_vec()) };
+                unsafe { egl.GetProcAddress(f.as_ptr().cast()) }.cast()
+            });
+            unsafe { init_debug(); }
+        });
+        todo!();
+    }
+
+    #[cfg(not(target_family = "unix"))]
+    #[inline(always)]
+    fn new() -> Option<Self> {
+        None
+    }
+}
+
+impl GraphicsExt for Glx {
+    type Display = NonNull<glx::types::Display>;
+    type Context = NonNull<c_void>;
+    unsafe fn current_display(&self) -> Option<Self::Display> {
+        NonNull::new(self.GetCurrentDisplay())
+    }
+
+    unsafe fn current_context(&self) -> Option<Self::Context> {
+        NonNull::new(self.GetCurrentContext().cast_mut())
+    }
+
+    fn new() -> Option<GlData> {
         let glx = Glx::load_with(|func| {
             let func = unsafe { CString::from_vec_unchecked(func.as_bytes().to_vec()) };
             GLX.get(&func)
         });
 
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
+        let (x_display, glx_context, config_id, screen) = unsafe {
+            let (display, ctx) = (glx.current_display()?, glx.current_context()?);
+            let mut config_id = 0;
+            if glx.QueryContext(
+                display.as_ptr(),
+                ctx.as_ptr(),
+                glx::FBCONFIG_ID as _,
+                &mut config_id
+            ) != Success as i32 {
+                return None;
+            }
+            let mut screen = MaybeUninit::uninit();
+            if glx.QueryContext(
+                display.as_ptr(),
+                ctx.as_ptr(),
+                glx::SCREEN as _,
+                screen.as_mut_ptr()
+            ) != Success as i32 {
+                return None;
+            }
+            (display.as_ptr(), ctx.as_ptr().cast_const(), config_id, screen.assume_init())
+        };
+
+        LOAD_GL.call_once(|| {
             gl::load_with(|f| {
                 let f = unsafe { CString::from_vec_unchecked(f.as_bytes().to_vec()) };
                 unsafe { glx.GetProcAddress(f.as_ptr().cast()) }.cast()
             });
-
-            if log::log_enabled!(log::Level::Debug) {
-                unsafe {
-                    gl::DebugMessageCallback(Some(debug_message), std::ptr::null());
-                    gl::Enable(gl::DEBUG_OUTPUT);
-                }
-            }
+            unsafe { init_debug(); }
         });
 
         // Grab the session info on creation - this makes us resilient against session restarts,
         // which could result in us trying to grab the context from a different thread
         let session_info = unsafe {
-            let x_display = glx.GetCurrentDisplay();
-            let glx_context = glx.GetCurrentContext();
             let glx_drawable = glx.GetCurrentDrawable();
-            let mut config_id = 0;
-            assert_eq!(
-                glx.QueryContext(
-                    x_display,
-                    glx_context,
-                    glx::FBCONFIG_ID as _,
-                    &mut config_id
-                ),
-                Success as i32
-            );
-
-            let mut screen = 0;
-            assert_eq!(
-                glx.QueryContext(x_display, glx_context, glx::SCREEN as _, &mut screen),
-                Success as i32
-            );
 
             let attrs = [glx::FBCONFIG_ID, config_id as _, glx::NONE];
             let mut items = 0;
@@ -115,7 +190,7 @@ impl GlData {
             format: 0,
             read_fbo: fbos[0],
             draw_fbo: fbos[1],
-        }
+        }.into()
     }
 }
 
